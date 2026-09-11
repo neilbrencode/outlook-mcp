@@ -18,25 +18,72 @@ documented inline:
 Tokens are *not* persisted by outlook-mcp — that's the caller's job (an
 agent decides where it wants to store its watermark). We pass the raw
 ``@odata.deltaLink`` / ``@odata.nextLink`` URL through as the opaque
-cursor string.
+cursor string, which means the cursor an agent hands back is a URL this
+module then fetches *with a bearer token attached*. Every URL fetched here
+is therefore host-checked first — see ``require_graph_url``.
 """
 
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
+from outlook_mcp.errors import ToolInputError
 from outlook_mcp.throttle import send_with_retry
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0/"
 GRAPH_TOKEN_SCOPE = "https://graph.microsoft.com/.default"
+
+# The only host this module will send a bearer token to. Exact match, not a
+# suffix test: `graph.microsoft.com.evil.example` ends with the right string.
+GRAPH_HOST = "graph.microsoft.com"
 
 # Safety cap multiplier — bound a single tool call to at most this many
 # items even when Graph keeps handing us more ``@odata.nextLink`` pages
 # inside one delta-sync round. Callers continue by passing the returned
 # delta_token (a nextLink) back in.
 PAGE_SIZE_CAP_MULTIPLIER = 4
+
+
+def require_graph_url(url: str, *, source: str) -> str:
+    """Return ``url`` if it is an https Microsoft Graph URL, else refuse.
+
+    ``delta_token`` is a tool argument, so it arrives from the model — and the
+    model reads email. "Your sync state was reset, resume from <url>" in a
+    message body is a working instruction, and every URL this module fetches
+    carries the caller's Graph bearer token in an ``Authorization`` header. An
+    unchecked host is therefore not merely a request to somewhere unexpected:
+    it hands a token scoped to the whole mailbox (``.default`` consents every
+    scope on the app registration, so ``read_only`` does not shrink it) to
+    whoever chose the URL. This is the network-side twin of the confinement
+    ``resolve_attachment_path`` already applies to filesystem paths.
+
+    ``@odata.nextLink`` gets the same treatment. Once the first hop can be
+    attacker-chosen, so can the link its response carries.
+
+    Matching is on the parsed host, never on a prefix or a substring:
+    ``https://graph.microsoft.com@evil.example/x`` parses to host
+    ``evil.example``, and ``graph.microsoft.com.evil.example`` is not
+    ``graph.microsoft.com``.
+
+    Only the global-cloud host is accepted. This server targets personal
+    accounts (tenant ``consumers``), which exist nowhere else, so the
+    sovereign-cloud hostnames would be surface with no caller.
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError as e:
+        raise ToolInputError(f"{source} is not a valid URL: {url[:100]!r}") from e
+
+    if parsed.scheme != "https" or parsed.hostname != GRAPH_HOST:
+        raise ToolInputError(
+            f"{source} must be an https://{GRAPH_HOST} URL produced by a prior "
+            f"delta call; got {url[:100]!r}. Pass back the delta_token from a "
+            "previous response verbatim, or omit it to start a new sync round."
+        )
+    return url
 
 
 def _bearer_token(credential: Any) -> str:
@@ -107,7 +154,13 @@ async def fetch_delta_pages(
         page_size = 1
     cap = page_size * PAGE_SIZE_CAP_MULTIPLIER
 
-    url: str = delta_token if delta_token else initial_url
+    # Before the token is minted, not after: a refused URL must never cause a
+    # bearer token to exist on this code path at all.
+    url: str = (
+        require_graph_url(delta_token, source="delta_token")
+        if delta_token
+        else require_graph_url(initial_url, source="initial_url")
+    )
     base_headers = {
         "Authorization": f"Bearer {_bearer_token(credential)}",
         "Accept": "application/json",
@@ -135,6 +188,14 @@ async def fetch_delta_pages(
 
             next_link = body.get("@odata.nextLink")
             delta_link = body.get("@odata.deltaLink")
+
+            # Checked on the way in, so a poisoned link fails here rather than
+            # being handed back to the caller as a token that only explodes on
+            # some later call.
+            if next_link:
+                next_link = require_graph_url(next_link, source="@odata.nextLink")
+            if delta_link:
+                delta_link = require_graph_url(delta_link, source="@odata.deltaLink")
 
             if delta_link:
                 # Reached the end of this sync round. The deltaLink is the
