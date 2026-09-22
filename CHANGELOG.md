@@ -45,10 +45,26 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   indistinguishable in them while behaving differently across a transition. Listings and the
   delta formatter are unchanged.
 
-  Abbreviations are refused locally with the zone name to use instead: `PDT` is not a zone
-  name, and Graph answers it with `400 TimeZoneNotSupportedException`. So are `EST`, `MST` and
-  `HST` — those *do* resolve as IANA keys, and Graph rejects them anyway (verified live), while
-  being fixed-offset zones that would not follow daylight saving even if it accepted them.
+  Abbreviations passed as `timezone` are refused locally with the zone name to use instead:
+  `PDT` is not a zone name, and Graph answers it with `400 TimeZoneNotSupportedException`. So
+  are `EST`, `MST` and `HST` — those *do* resolve as IANA keys, and Graph rejects them anyway
+  (verified live), while being fixed-offset zones that would not follow daylight saving even if
+  it accepted them.
+
+  An existing `config.timezone` holding one of those three is **not** refused. Nothing ever sent
+  it anywhere before this release, so an install carrying one has been working; refusing it now
+  would leave that server reading calendars happily while every `outlook_create_event` without an
+  explicit `timezone` failed. Instead such an event is anchored in **UTC** — exactly what this
+  server wrote before it sent a zone at all — and a warning is logged once per run naming the
+  config key and the IANA zone to set. Those installs are no worse off than before; they simply
+  do not get DST-correct recurring events until someone edits one line.
+
+  `EST` is deliberately *not* translated to `America/New_York`: they are different zones. `EST` is
+  a fixed UTC−05:00 that never observes daylight saving, and that is how `resolve_timezone` — and
+  therefore every calendar *read* — already interprets the value, so anchoring writes in a
+  DST-observing zone would make the two halves of the server disagree about the same string every
+  summer. A *misspelt* `config.timezone` is an error for the same reason: it already fails every
+  calendar read, and inventing a zone for its writes would split the two apart.
 
 - **`classification` was always empty outside the inbox listing.** `outlook_search_mail`,
   `outlook_list_drafts` and `outlook_get_thread` share `list_inbox`'s summary formatter, which

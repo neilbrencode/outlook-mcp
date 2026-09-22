@@ -341,6 +341,8 @@ class TestRemovingRecurrence:
 # the week daylight saving ends and reports `status: created` throughout.
 
 _DST_ZONE = "America/Los_Angeles"
+# A second real zone, three hours from the first, for the split-anchor case.
+_EAST = "America/New_York"
 
 
 def _next_dst_transition(zone_name: str) -> date | None:
@@ -538,6 +540,129 @@ class TestTimeZoneAnchoring:
             assert _utc_instant(after["start"]) != "11:00:00", (
                 "11:00 New York came back as 11:00Z, so the new time was labelled UTC"
             )
+
+    async def test_a_late_evening_series_is_not_scheduled_a_day_late(
+        self, real_graph_client, live_write_config
+    ):
+        """An instant whose UTC date is not its date in the anchor zone.
+
+        A 18:00 Pacific event is next-day in UTC, so `Z` input and a real
+        anchor disagree about which day the series starts on. Graph does not
+        refuse the inconsistency — it accepts the master and schedules the
+        whole series on the wrong weekday, a full day late, answering
+        `status: created`. That is the silent class, and only a live call sees
+        it: the payload we build is well-formed either way.
+        """
+        zone = _DST_ZONE
+        # Pick a Wednesday far enough out to be uncluttered, then name the
+        # instant in UTC — 01:00Z Thursday is 18:00 Wednesday there.
+        wednesday = _anchor_monday() + timedelta(days=2)
+        thursday = wednesday + timedelta(days=1)
+        offset = datetime.combine(wednesday, dt_time(18, 0), tzinfo=ZoneInfo(zone)).utcoffset()
+        assert offset is not None
+        utc_hour = 18 - int(offset.total_seconds() // 3600)
+        assert utc_hour >= 24, (
+            f"18:00 in {zone} must fall on the next UTC day for this test to mean "
+            f"anything; it is {utc_hour:02d}:00Z the same day"
+        )
+
+        subject = LIVE_WRITE_SUBJECT + " tz-dateline"
+        async with _temporary_event(
+            real_graph_client,
+            live_write_config,
+            subject_suffix=" tz-dateline",
+            start=f"{thursday.isoformat()}T{utc_hour - 24:02d}:00:00Z",
+            end=f"{thursday.isoformat()}T{utc_hour - 23:02d}:00:00Z",
+            timezone=zone,
+            recurrence="weekly",
+        ) as event_id:
+            detail = await get_event(real_graph_client.sdk_client, event_id)
+            assert detail["recurrence"]["range"]["startDate"] == wednesday.isoformat(), (
+                "the range begins on the UTC date, not the event's date in its own zone"
+            )
+            assert detail["recurrence"]["pattern"]["daysOfWeek"] == ["wednesday"], (
+                "the shorthand expanded against the UTC weekday"
+            )
+
+            listing = await list_events(
+                real_graph_client.sdk_client,
+                after=f"{wednesday.isoformat()}T00:00:00Z",
+                before=f"{(wednesday + timedelta(days=9)).isoformat()}T00:00:00Z",
+                count=100,
+                timezone="UTC",
+            )
+            ours = [e for e in listing["events"] if e["subject"] == subject]
+            assert len(ours) == 2, (
+                f"expected 2 occurrences, found {len(ours)} in a window of "
+                f"{listing['count']} events — cannot tell a correct series from a late one"
+            )
+
+    async def test_an_event_whose_ends_are_in_different_zones_stays_that_way(
+        self, real_graph_client, live_write_config
+    ):
+        """A flight leaves New York and lands in Los Angeles.
+
+        Graph stores the two anchors independently, which a single-zone mental
+        model does not predict: sent as 08:00 New York to 11:00 Los Angeles,
+        this comes back 13:00Z to 19:00Z — a six-hour block, not three. An
+        update that derived one zone from the start and stamped it on both ends
+        would relabel the landing time and move it three hours, in a patch that
+        only meant to shift the departure.
+
+        `create_event` takes one `timezone`, so the split event is built here
+        through raw Graph; what is under test is that `update_event` preserves
+        a split it did not create — which is the realistic case, since these
+        come from Outlook and from airline invitations.
+        """
+        import httpx
+
+        monday = _anchor_monday()
+        token = real_graph_client.credential.get_token(
+            "https://graph.microsoft.com/.default"
+        ).token
+        auth = {"Authorization": f"Bearer {token}"}
+        subject = LIVE_WRITE_SUBJECT + " tz-split"
+
+        created = httpx.post(
+            "https://graph.microsoft.com/v1.0/me/events",
+            headers={**auth, "Content-Type": "application/json"},
+            json={
+                "subject": subject,
+                "start": {"dateTime": f"{monday.isoformat()}T08:00:00", "timeZone": _EAST},
+                "end": {"dateTime": f"{monday.isoformat()}T11:00:00", "timeZone": _DST_ZONE},
+            },
+            timeout=30,
+        )
+        created.raise_for_status()
+        event_id = created.json()["id"]
+
+        try:
+            before = await get_event(real_graph_client.sdk_client, event_id)
+            if before["original_end_time_zone"] == before["original_start_time_zone"]:
+                pytest.skip(
+                    "this mailbox collapsed the two anchors onto one zone "
+                    f"({before['original_start_time_zone']}), so there is no split to preserve"
+                )
+
+            await update_event(
+                real_graph_client.sdk_client,
+                event_id=event_id,
+                start=f"{monday.isoformat()}T09:00:00",
+                end=f"{monday.isoformat()}T12:00:00",
+                config=live_write_config,
+            )
+
+            after = await get_event(real_graph_client.sdk_client, event_id)
+            assert after["original_start_time_zone"] == _EAST
+            assert after["original_end_time_zone"] == _DST_ZONE, (
+                "the end was relabelled with the start's zone, moving the landing time"
+            )
+            # 09:00 Eastern to 12:00 Pacific is six hours, not three.
+            start_hour = int(_utc_instant(after["start"])[:2])
+            end_hour = int(_utc_instant(after["end"])[:2])
+            assert end_hour - start_hour == 6
+        finally:
+            await delete_event(real_graph_client.sdk_client, event_id, config=live_write_config)
 
     async def test_a_utc_series_can_be_re_anchored_into_a_zone(
         self, real_graph_client, live_write_config

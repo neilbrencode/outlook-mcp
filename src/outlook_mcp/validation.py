@@ -1,8 +1,15 @@
 """Input validation — patterns ported from olkcli (MIT)."""
 
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+logger = logging.getLogger(__name__)
+
+# Process-local latch so the legacy-zone substitution warns at most once per
+# run rather than on every event created.
+_warned_legacy_config_zone: set[str] = set()
 
 # Graph API entity ID pattern: alphanumeric, =, +, /, -
 _GRAPH_ID_RE = re.compile(r"^[a-zA-Z0-9_=+/\-]{1,1024}$")
@@ -179,7 +186,16 @@ def validate_event_timezone(name: str) -> str:
     than ours. Returns the name unchanged so callers rebind rather than
     validate-and-discard.
     """
-    key = name.strip()
+    key = name.strip() if isinstance(name, str) else name
+    if not key:
+        # An empty string is a caller who meant something and sent nothing.
+        # Falling back to the configured zone would anchor the event somewhere
+        # they never named and report success, while a whitespace-only value
+        # one keystroke away is refused — so refuse both, the same way.
+        raise ValueError(
+            "timezone is empty. Omit it to anchor the event in the server's "
+            "configured zone, or pass an IANA zone name like America/Los_Angeles."
+        )
     replacement = _ZONES_GRAPH_REFUSES.get(key.upper())
     if replacement:
         raise ValueError(
@@ -189,6 +205,56 @@ def validate_event_timezone(name: str) -> str:
         )
     resolve_timezone(key)
     return key
+
+
+def resolve_config_event_timezone(name: str) -> str:
+    """The zone to anchor an event in when the caller named none.
+
+    Same standard as :func:`validate_event_timezone` with one exception, and
+    the exception is the point: a *stored* ``config.timezone`` of ``EST`` came
+    from an install that worked. Before events carried a real zone at all, the
+    value was never sent — every event went out labelled ``UTC`` — so nothing
+    ever rejected it, and a config file on disk today can perfectly well hold
+    one. Refusing it here would leave that server running, reading calendars
+    happily, and failing every ``outlook_create_event`` that does not pass an
+    explicit ``timezone``. An upgrade must not do that.
+
+    So such a value falls back to ``UTC`` — which is *exactly* what every event
+    this server wrote was anchored in before 1.23.0 — and says so, once per run
+    per name, naming the config key and the one-line change that earns the fix.
+    Nothing about that install gets worse; it simply does not get better until
+    someone edits the config.
+
+    Translating ``EST`` to ``America/New_York`` was the obvious alternative and
+    is wrong: they are not the same zone. ``EST`` is a fixed UTC−05:00 with no
+    daylight saving, which is how ``resolve_timezone`` — and therefore every
+    calendar *read* — already interprets that config value. Anchoring writes in
+    a DST-observing zone would make the two halves of the server disagree about
+    the same string every summer, and would be this function inventing a
+    meaning the operator never asked for. The same argument is why a *typo* is
+    refused rather than guessed at; it applies here too.
+
+    An explicit ``timezone`` argument gets no tolerance at all — it is written
+    fresh on every call and cannot be a legacy anything.
+    """
+    key = name.strip() if isinstance(name, str) else name
+    if key and str(key).upper() in _ZONES_GRAPH_REFUSES:
+        better = _ZONES_GRAPH_REFUSES[str(key).upper()]
+        if key not in _warned_legacy_config_zone:
+            _warned_legacy_config_zone.add(key)
+            logger.warning(
+                "config.timezone is %r, which Microsoft Graph rejects for calendar "
+                "events. Anchoring them in UTC, as this server did before it sent a "
+                "zone at all — so recurring events will still shift an hour across a "
+                "daylight-saving change. Set `timezone` in ~/.outlook-mcp/config.json "
+                "to %s (not %r, which is a fixed offset that never observes daylight "
+                "saving) to fix that.",
+                key,
+                better,
+                key,
+            )
+        return "UTC"
+    return validate_event_timezone(name)
 
 
 def validate_datetime(value: str, tz: str = "UTC", *, now: datetime | None = None) -> str:
