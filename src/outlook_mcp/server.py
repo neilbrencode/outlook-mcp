@@ -64,7 +64,8 @@ async def lifespan(server):
     system or the config file: a ``ValidationError`` (a value no release
     accepts), a ``PermissionError`` (the config is a symlink — refused on
     purpose), an ``OSError`` around it (unreadable file, chmod-protected
-    directory), or a non-UTF-8 file (``UnicodeDecodeError``). ``main``
+    directory), or a file that is neither UTF-8 nor a valid config in the
+    machine's code page (``UnicodeDecodeError``). ``main``
     already exits with the repair spelled out before the transport starts;
     this is the backstop for reaching the server without going through
     ``main``. Exiting from inside the async lifespan surfaces as an
@@ -231,8 +232,8 @@ async def outlook_auth_status(ctx: Context) -> dict:
     }
     if not auth.is_authenticated():
         if auth.startup_error is not None:
-            # Re-running auth would fail identically; say what actually needs
-            # changing.
+            # The refresh already named its own remedy — carry that instead
+            # of the generic line, which reads as "any re-auth will do".
             result["action_required"] = str(auth.startup_error)
         else:
             result["action_required"] = "Run `outlook-mcp auth` on the host to authenticate."

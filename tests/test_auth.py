@@ -4,13 +4,18 @@ import logging
 from unittest.mock import patch
 
 import pytest
+from azure.core.credentials import AccessToken
 from azure.core.exceptions import ClientAuthenticationError
 from azure.identity import AuthenticationRecord, DeviceCodeCredential
 
 from outlook_mcp import auth as auth_module
 from outlook_mcp.auth import AuthManager, _unencrypted_fallback_will_be_used
 from outlook_mcp.config import Config
-from outlook_mcp.errors import AuthRequiredError, UnencryptedTokenCacheError
+from outlook_mcp.errors import (
+    AuthRequiredError,
+    StaleConsentError,
+    UnencryptedTokenCacheError,
+)
 
 GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 
@@ -43,16 +48,16 @@ def test_auth_scopes_default():
     assert "offline_access" not in scopes
 
 
-def test_auth_scopes_read_only():
-    """Read-only mode uses read scopes."""
+def test_read_only_config_still_gets_the_read_write_scopes():
+    """read_only gates the tools, not the token: the config flag must not
+    narrow what the first consent asks for — the scopes it omits could never
+    be granted later without logging in again."""
     config = Config(client_id="test-id", read_only=True)
     auth = AuthManager(config)
     scopes = auth.get_scopes()
-    assert "Mail.Read" in scopes
-    assert "Mail.ReadWrite" not in scopes
-    assert "Mail.Send" not in scopes
-    assert "Calendars.Read" in scopes
-    assert "Calendars.ReadWrite" not in scopes
+    assert scopes == auth_module.SCOPES_READWRITE
+    # offline_access is reserved — MSAL adds it automatically
+    assert "offline_access" not in scopes
 
 
 def test_auth_not_authenticated():
@@ -377,3 +382,198 @@ class TestUnencryptedCacheIsOptIn:
         quiet = ClientAuthenticationError("Authentication failed: something else")
         quiet.__cause__ = original
         assert auth_module._is_azure_unencrypted_refusal(quiet) is False
+
+
+# ── Which scopes each path asks for, and why they differ ──────────────────
+#
+# A first consent that asks only for .default can land a session with no
+# delegated permissions on a personal account, and no scope can be redeemed
+# from that session afterwards (AADSTS70000) — only logging in again. So the
+# interactive flow consents the concrete read-write scopes — in read-only
+# mode too, because read_only gates the tools, not the token, and a
+# read-only consent could never be widened once the config flips — while
+# silent refresh, serving from an already-issued session, redeems .default:
+# the one scope every saved record can still serve.
+
+
+class TestFirstConsentScopes:
+    """The interactive flow consents the concrete read-write scopes, never
+    .default — whatever read_only says."""
+
+    def _consented_scopes(self, config: Config) -> tuple[str, ...]:
+        """Run login_interactive against a mocked credential; return its scopes."""
+        auth = AuthManager(config)
+        with (
+            patch(
+                "outlook_mcp.auth._unencrypted_fallback_will_be_used",
+                return_value=False,
+            ),
+            patch("outlook_mcp.auth.DeviceCodeCredential") as cred_cls,
+            patch("outlook_mcp.auth._save_auth_record"),
+        ):
+            auth.login_interactive()
+        return cred_cls.return_value.get_token.call_args.args
+
+    def test_read_write_mode_consents_the_write_scopes(self):
+        """The consent names Mail.ReadWrite & co. — and not .default, whose
+        first-time consent is what strands an MSA session with nothing."""
+        scopes = self._consented_scopes(Config(client_id="test-id"))
+        assert scopes == tuple(auth_module.SCOPES_READWRITE)
+        assert GRAPH_SCOPE not in scopes
+
+    def test_read_only_mode_still_consents_the_write_scopes(self):
+        """read_only gates the tools, not the token — the consent always
+        names the full read-write set. A read-only first consent would strand
+        writes forever: silent refresh redeems .default, which means exactly
+        the consented set, so the write scopes could never be added once the
+        config flips without logging in again."""
+        scopes = self._consented_scopes(Config(client_id="test-id", read_only=True))
+        assert scopes == tuple(auth_module.SCOPES_READWRITE)
+        assert GRAPH_SCOPE not in scopes
+
+
+class _DefaultConsentCredential:
+    """A record-pinned credential whose session consented `.default` alone.
+
+    This is the stranded MSA session as an offline fixture: it serves
+    `.default` — the one scope a `.default`-only consent can still redeem —
+    and refuses every concrete scope exactly the way the live endpoint
+    refuses it. Records saved before the consent fix have precisely these
+    capabilities, which is why silent refresh must stay on `.default`.
+    """
+
+    def __init__(
+        self,
+        *,
+        client_id: str,
+        tenant_id: str,
+        cache_persistence_options,
+        timeout: int = 0,
+        disable_automatic_authentication: bool = False,
+        prompt_callback=None,
+        authentication_record: AuthenticationRecord | None = None,
+    ) -> None:
+        self._record = authentication_record
+        self.requested_scopes: list[tuple[str, ...]] = []
+
+    def get_token(self, *scopes) -> AccessToken:
+        self.requested_scopes.append(scopes)
+        if scopes == (GRAPH_SCOPE,):
+            return AccessToken("token-from-a-default-consent", 0)
+        raise ClientAuthenticationError(
+            "Authentication failed: AADSTS70000: The requested user must "
+            "first sign-in and grant the client application access"
+        )
+
+
+class TestSilentRefreshScope:
+    """Silent refresh redeems .default — the scope every record can serve."""
+
+    def test_a_record_saved_under_a_default_consent_still_refreshes(self):
+        """The regression pin for the consent change.
+
+        A record whose session consented `.default` alone can redeem nothing
+        but `.default`. Refreshing with the concrete consent list instead —
+        the tempting "consistency" change — would brick every such record
+        the moment its token expires, so the refresh is pinned here against
+        a credential that refuses everything but `.default`, the way the
+        live endpoint does.
+        """
+        auth = AuthManager(Config(client_id="test-id"))
+        record = AuthenticationRecord(
+            tenant_id="consumers",
+            client_id="test-id",
+            authority="https://login.microsoftonline.com/consumers",
+            home_account_id="home-1",
+            username="user@example.com",
+        )
+        with (
+            patch(
+                "outlook_mcp.auth._unencrypted_fallback_will_be_used",
+                return_value=False,
+            ),
+            patch("outlook_mcp.auth._load_auth_record", return_value=record),
+            patch("outlook_mcp.auth.DeviceCodeCredential", _DefaultConsentCredential),
+        ):
+            assert auth.try_cached_token() is True
+
+        cred = auth.get_credential()
+        assert isinstance(cred, _DefaultConsentCredential)
+        assert cred.requested_scopes == [(GRAPH_SCOPE,)]
+
+
+class TestStaleConsentRemedy:
+    """An AADSTS70000 refresh failure must say "log in again", not "retry"."""
+
+    RECORD = AuthenticationRecord(
+        tenant_id="consumers",
+        client_id="test-id",
+        authority="https://login.microsoftonline.com/consumers",
+        home_account_id="home-1",
+        username="user@example.com",
+    )
+
+    # The refusal as it arrives from azure-identity: MSAL's text embedded in
+    # the wrapped ClientAuthenticationError.
+    AADSTS70000_REFUSAL = ClientAuthenticationError(
+        "Authentication failed: AADSTS70000: The requested user must first "
+        "sign-in and grant the client application access. The user must "
+        "re-authenticate."
+    )
+
+    def test_the_dead_end_sets_the_log_in_again_error(self):
+        """Named code, named exit: the error's own text suggests neither.
+
+        The refusal is injected on a real credential's token path (the
+        ``_get_app`` seam the unencrypted-refusal tests use) so it travels
+        through the same wrapping a live failure would.
+        """
+        auth = AuthManager(Config(client_id="test-id"))
+        with (
+            patch("outlook_mcp.auth._load_auth_record", return_value=self.RECORD),
+            patch(
+                "outlook_mcp.auth._unencrypted_fallback_will_be_used",
+                return_value=False,
+            ),
+            patch.object(
+                DeviceCodeCredential, "_get_app", side_effect=self.AADSTS70000_REFUSAL
+            ),
+        ):
+            assert auth.try_cached_token() is False
+
+        assert auth.is_authenticated() is False
+        assert isinstance(auth.startup_error, StaleConsentError)
+        remedy = str(auth.startup_error)
+        assert "AADSTS70000" in remedy
+        assert "Log in again" in remedy
+        # AADSTS70000 is Entra's generic invalid-grant — a revoked refresh
+        # token reports it too — so the remedy hedges instead of asserting
+        # the skipped-consent story as the only possibility.
+        assert "most often" in remedy
+        assert "revoked" in remedy
+
+    def test_an_ordinary_stale_token_keeps_the_ordinary_remedy(self):
+        """An expired token is refreshable — it must not claim the dead end.
+
+        Two failure classes, two remedies: only the AADSTS70000 refusal gets
+        the log-in-again error; anything else stays a plain stale token that
+        `outlook-mcp auth` fixes.
+        """
+        auth = AuthManager(Config(client_id="test-id"))
+        expired = ClientAuthenticationError(
+            "Authentication failed: AADSTS7000215: Invalid grant. The token "
+            "is expired or revoked."
+        )
+        with (
+            patch("outlook_mcp.auth._load_auth_record", return_value=self.RECORD),
+            patch(
+                "outlook_mcp.auth._unencrypted_fallback_will_be_used",
+                return_value=False,
+            ),
+            patch.object(DeviceCodeCredential, "_get_app", side_effect=expired),
+        ):
+            assert auth.try_cached_token() is False
+
+        assert auth.startup_error is None  # AuthRequiredError on use, not this
+        with pytest.raises(AuthRequiredError):
+            auth.get_credential()

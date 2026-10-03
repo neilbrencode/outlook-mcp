@@ -23,6 +23,7 @@ from outlook_mcp.config import Config
 from outlook_mcp.errors import (
     AuthRequiredError,
     ConfigLoadError,
+    StaleConsentError,
     UnencryptedTokenCacheError,
 )
 from outlook_mcp.server import lifespan, outlook_auth_status
@@ -81,6 +82,25 @@ async def test_an_ordinary_unauthenticated_host_is_unchanged():
     assert result["action_required"] == (
         "Run `outlook-mcp auth` on the host to authenticate."
     )
+
+
+@pytest.mark.asyncio
+async def test_auth_status_names_the_70000_dead_end_and_says_log_in_again():
+    """The AADSTS70000 session is unrecoverable; the remedy must say so.
+
+    The generic "run outlook-mcp auth" reads as an optional top-up, and the
+    error's own text suggests a retry that cannot work. The startup error
+    set by the failed refresh has to reach the tool verbatim: code named,
+    exit named.
+    """
+    auth = AuthManager(Config(client_id="x"))
+    auth.startup_error = StaleConsentError()
+
+    result = await outlook_auth_status(_ctx(auth))
+
+    assert result["authenticated"] is False
+    assert "AADSTS70000" in result["action_required"]
+    assert "Log in again" in result["action_required"]
 
 
 # ── A config the server cannot load fails with the fix, never a traceback ──
@@ -146,8 +166,10 @@ async def test_symlinked_config_boots_the_same_way(caplog):
 
 @pytest.mark.asyncio
 async def test_unreadable_or_non_utf8_config_boots_the_same_way(caplog):
-    """chmod/read failures are OSErrors and non-UTF-8 bytes are ValueErrors —
-    both arms have to land in the same degraded boot, not escape the lifespan."""
+    """chmod/read failures are OSErrors and undecodable bytes are ValueErrors —
+    both arms have to land in the same degraded boot, not escape the lifespan.
+    They share the boot, not the remedy: config_repair_lines gives the decode
+    failure its own (test_config.py)."""
     import logging
 
     failures = (
@@ -227,11 +249,15 @@ def test_main_exits_cleanly_on_a_non_utf8_config(tmp_path):
     config_dir.mkdir()
     (config_dir / "config.json").write_bytes(b'\xff\xfe{"client_id": "x"}')
 
+    proc = _run_server_entry(config_dir)
     _assert_clean_exit(
-        _run_server_entry(config_dir),
+        proc,
         "Cannot load the config file",
+        "must be saved as UTF-8",
         str(config_dir),  # the repair names the directory to check
     )
+    # The generic remedy is the wrong one for an encoding (#99).
+    assert "readable and owned" not in proc.stderr
 
 
 def test_main_exits_cleanly_on_a_symlinked_config(tmp_path):

@@ -18,6 +18,7 @@ from outlook_mcp.config import DEFAULT_CONFIG_DIR, Config, _ensure_dir, atomic_w
 from outlook_mcp.errors import (
     AuthRequiredError,
     OutlookMCPError,
+    StaleConsentError,
     UnencryptedTokenCacheError,
 )
 
@@ -28,21 +29,21 @@ logger = logging.getLogger(__name__)
 # and try_cached_token, often multiple times during startup.
 _warned_unencrypted_fallback = False
 
-# Display-only; token acquisition uses .default (GRAPH_DEFAULT_SCOPE below).
+# The concrete delegated scopes the first consent asks for — always the full
+# read-write set, whatever read_only says: read_only gates the tools, not the
+# token (#58), and the scopes a first consent omits can never be redeemed from
+# the session it creates, so a read-only consent could never be widened after
+# the config flips. The FIRST consent names exactly these (login_interactive);
+# every request afterwards — silent refresh and the Graph SDK's internal calls
+# alike — uses .default, which on an already-consented session means precisely
+# "the consented set". MSAL adds offline_access to its token requests itself,
+# so it is deliberately absent.
 SCOPES_READWRITE = [
     "Mail.ReadWrite",
     "Mail.Send",
     "Calendars.ReadWrite",
     "Contacts.ReadWrite",
     "Tasks.ReadWrite",
-    "User.Read",
-]
-
-SCOPES_READONLY = [
-    "Mail.Read",
-    "Calendars.Read",
-    "Contacts.Read",
-    "Tasks.Read",
     "User.Read",
 ]
 
@@ -101,9 +102,29 @@ def _is_azure_unencrypted_refusal(exc: BaseException) -> bool:
     return _AZURE_UNENCRYPTED_MARKER in str(exc)
 
 
-# The Graph SDK always requests .default scope internally, so we must
-# acquire and cache tokens with the same scope to avoid cache misses
-# that trigger interactive auth in the background.
+# A session whose first consent went through .default alone can land with no
+# delegated permissions on it, and redeeming any concrete scope from that
+# session is refused with AADSTS70000 ("The requested user must first sign-in
+# and grant the client application access"). AADSTS70000 is Entra's generic
+# invalid-grant — a revoked refresh token reports it too — but every case it
+# covers is a dead end for this process with the same exit: a fresh sign-in.
+# The code embeds itself in the wrapped ClientAuthenticationError text like
+# every MSAL error does, so matching the code on str(exc) is the whole check.
+# The refusal's own wording reads like a retryable blip, which is why the
+# remedy says "log in again" in so many words.
+_AADSTS70000_MARKER = "AADSTS70000"
+
+
+def _is_consent_dead_end(exc: BaseException) -> bool:
+    """True for the "this session can never grant that scope" refusal."""
+    return _AADSTS70000_MARKER in str(exc)
+
+
+# The Graph SDK always requests .default scope internally, so silent refresh
+# must acquire and cache tokens under the same scope — it is the cache key the
+# SDK's calls land on. On a session that already consented concrete scopes,
+# .default means exactly that consented set. Only the first consent must name
+# the concrete scopes instead (see login_interactive).
 GRAPH_DEFAULT_SCOPE = "https://graph.microsoft.com/.default"
 
 
@@ -135,7 +156,9 @@ def _load_auth_record() -> AuthenticationRecord | None:
     if not path.exists():
         return None
     try:
-        return AuthenticationRecord.deserialize(path.read_text())
+        # Pairs with atomic_write's UTF-8. The record is ASCII JSON today (serialize() escapes
+        # non-ASCII), so this is consistency with the writer, not a fix (#99).
+        return AuthenticationRecord.deserialize(path.read_text(encoding="utf-8"))
     except Exception:
         logger.warning("Failed to load auth record from %s", path)
         return None
@@ -154,12 +177,17 @@ class AuthManager:
         self.startup_error: OutlookMCPError | None = None
 
     def get_scopes(self) -> list[str]:
-        """Return individual scopes for display/consent purposes."""
-        return SCOPES_READONLY if self.config.read_only else SCOPES_READWRITE
+        """Return the concrete delegated scopes the first consent asks for.
 
-    def get_token_scopes(self) -> list[str]:
-        """Return scopes for token acquisition — must match what the SDK requests."""
-        return [GRAPH_DEFAULT_SCOPE]
+        Always the full read-write set, whatever ``read_only`` says: that flag
+        gates the tools, not the token (#58). Which list this returns decides
+        what the account is ever able to grant — the scopes a first consent
+        omits cannot be redeemed from the session it creates, and because
+        every later request renews via ``.default`` ("the consented set"), a
+        read-only first consent could never be widened once the config flips
+        to ``read_only: false``. So the consent is always asked wide.
+        """
+        return SCOPES_READWRITE
 
     def is_authenticated(self) -> bool:
         """Check if we have an active credential."""
@@ -254,9 +282,17 @@ class AuthManager:
         # get_token() consults the persistent cache first, but without a
         # record the silent path always misses (see the docstring above), so
         # this call is the interactive flow.
-        # Must use .default scope to match what the Graph SDK requests.
+        #
+        # The first consent must name the concrete delegated scopes, never
+        # .default: on a personal account a .default-only first consent can
+        # land a session with no delegated permissions, and no scope can be
+        # redeemed from it afterwards (AADSTS70000) — only logging in again
+        # fixes that. Once these scopes are consented, everything later uses
+        # .default, which then means exactly this consented set. The list is
+        # the read-write one whatever read_only says (see get_scopes): that
+        # flag gates the tools, not the token.
         try:
-            cred.get_token(*self.get_token_scopes())
+            cred.get_token(*self.get_scopes())
         except ClientAuthenticationError as exc:
             if _is_azure_unencrypted_refusal(exc):
                 raise UnencryptedTokenCacheError() from exc
@@ -285,7 +321,13 @@ class AuthManager:
 
         try:
             cred = self._make_credential(auth_record=record, silent=True)
-            cred.get_token(*self.get_token_scopes())
+            # .default, not the consent list: this refreshes through the
+            # saved record, and a record's session redeems .default however
+            # it was consented — while a .default-only consent (the trap
+            # login_interactive now avoids) redeems nothing else. The Graph
+            # SDK asks under .default too, so this is also the cache key
+            # that keeps its first call off the network.
+            cred.get_token(GRAPH_DEFAULT_SCOPE)
             self.credential = cred
             return True
         except UnencryptedTokenCacheError:
@@ -301,6 +343,15 @@ class AuthManager:
             # with the same remedy.
             if _is_azure_unencrypted_refusal(exc):
                 raise UnencryptedTokenCacheError() from exc
+            if _is_consent_dead_end(exc):
+                # Name the dead end rather than offering the generic remedy:
+                # "re-run auth" reads as an optional top-up, but no refresh
+                # from this process can succeed again — the session cannot
+                # grant what is being asked for. Surfaced as the startup
+                # error so auth_status and every tool call carry it.
+                self.startup_error = StaleConsentError()
+                logger.warning("%s", self.startup_error)
+                return False
             logger.warning("Cached token refresh failed — re-run `outlook-mcp auth`.")
             return False
 

@@ -150,6 +150,36 @@ class UnencryptedTokenCacheError(OutlookMCPError):
         )
 
 
+class StaleConsentError(OutlookMCPError):
+    """Raised when the cached sign-in session cannot grant what we request.
+
+    AADSTS70000 is Entra's generic invalid-grant, so it names a family of
+    dead ends rather than one. The one that motivated this error: a
+    first-time consent that went through ``.default`` alone lands as a
+    signed-in session carrying no delegated permissions, and redeeming any
+    scope from it is refused — wording that suggests signing in and trying
+    again, which is in fact the only exit, because the missing consent
+    cannot be redeemed from the session that skipped it. A revoked refresh
+    token reports the same code, and the remedy is the same. It says "log
+    in again" in those words because the error's own text never does, and
+    every less specific remedy reads as an optional top-up.
+    """
+
+    def __init__(self):
+        super().__init__(
+            "stale_consent",
+            "The cached sign-in session cannot serve a token for the scopes "
+            "this server requests (AADSTS70000: The requested user must first "
+            "sign-in and grant the client application access).",
+            "Log in again — run `outlook-mcp auth` on the host and complete "
+            "the sign-in. This is most often not an expired token: the "
+            "consent was skipped when the session was issued and cannot be "
+            "redeemed from it, so no retry or refresh will fix it. (A "
+            "revoked refresh token reports the same code; logging in again "
+            "is the remedy there too.)",
+        )
+
+
 class ConfigLoadError(OutlookMCPError):
     """The settings file could not be loaded; the server booted fail-safe.
 

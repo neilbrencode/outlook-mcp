@@ -43,6 +43,35 @@ def test_status_authenticated_flow_reads_only_the_patched_record(capsys, monkeyp
     assert "outlook-mcp auth" in out
 
 
+def test_status_surfaces_a_named_remedy_instead_of_the_generic_line(
+    capsys, monkeypatch
+):
+    """The AADSTS70000 dead end must not print "Run: outlook-mcp auth" alone.
+
+    That line reads as "any re-auth will do" when only a fresh login exits,
+    so when the refresh set a startup error with its own remedy, that is
+    what status prints.
+    """
+    from unittest.mock import patch
+
+    from outlook_mcp.errors import StaleConsentError
+
+    monkeypatch.setattr(cli, "load_config", lambda: Config(client_id="test-id"))
+
+    def _dead_end_refresh(self):
+        self.startup_error = StaleConsentError()
+        return False
+
+    with patch.object(cli.AuthManager, "try_cached_token", _dead_end_refresh):
+        cli.cmd_status()
+
+    out = capsys.readouterr().out
+    assert "not authenticated" in out
+    assert "AADSTS70000" in out
+    assert "Log in again" in out
+    assert "Run: outlook-mcp auth" not in out
+
+
 def test_auth_without_config_exits_with_the_fix(capsys, monkeypatch):
     monkeypatch.setattr(cli, "load_config", lambda: Config())
     with pytest.raises(SystemExit) as exc:
@@ -109,3 +138,68 @@ def test_logout_removes_this_instances_record_and_says_what_stays(capsys, monkey
     assert "Microsoft.Developer.IdentityService" in out
     assert "left in place" in out
     assert "remove 'outlook-mcp'" not in out
+
+
+def test_auth_refusal_prints_the_remedy_not_a_traceback(capsys, monkeypatch):
+    """A refused first consent (e.g. an app registration missing one of the
+    delegated permissions) exits 1 with the registration remedy — the
+    concrete scopes make this reachable now, where a .default consent used
+    to "succeed" and strand the session instead."""
+    from azure.core.exceptions import ClientAuthenticationError
+
+    monkeypatch.setattr(cli, "load_config", lambda: Config(client_id="test-id"))
+
+    def _refused(self):
+        raise ClientAuthenticationError(
+            "Authentication failed: AADSTS65001: the user or administrator "
+            "has not consented to use the application"
+        )
+
+    monkeypatch.setattr(cli.AuthManager, "login_interactive", _refused)
+    with pytest.raises(SystemExit) as exc:
+        cli.cmd_auth()
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "Sign-in was refused" in err
+    assert "app registration" in err
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        # azure-identity's own device-code timeout text (device_code.py):
+        # no AADSTS code at all.
+        "Timed out waiting for user to authenticate",
+        # A declined sign-in surfaces as access_denied, not a consent-code.
+        "Authentication failed: access_denied: The user has denied access "
+        "to the app",
+        # A generic invalid grant (the AADSTS70000 family) — the code a
+        # stale consent or a revoked refresh token reports.
+        "Authentication failed: AADSTS70000: The requested user must first "
+        "sign-in and grant the client application access",
+    ],
+)
+def test_auth_non_consent_refusals_get_no_registration_remedy(
+    refusal, capsys, monkeypatch
+):
+    """Only the AADSTS65xxx refusals say anything about the app registration.
+
+    A timed-out device code, a declined sign-in and a generic invalid grant
+    are not the registration's fault, so they get the error text alone —
+    blaming the registration there would send the operator re-reading the
+    app setup for a problem their app does not have.
+    """
+    from azure.core.exceptions import ClientAuthenticationError
+
+    monkeypatch.setattr(cli, "load_config", lambda: Config(client_id="test-id"))
+
+    def _refused(self):
+        raise ClientAuthenticationError(refusal)
+
+    monkeypatch.setattr(cli.AuthManager, "login_interactive", _refused)
+    with pytest.raises(SystemExit) as exc:
+        cli.cmd_auth()
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "Sign-in was refused" in err
+    assert "app registration" not in err
