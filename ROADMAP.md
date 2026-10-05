@@ -15,17 +15,21 @@ Programmatic management of Outlook inbox rules via `/me/mailFolders/inbox/messag
 
 ### Read-only that Microsoft enforces
 
-`read_only: true` gates this server's write tools. It does not narrow the token:
-`get_token_scopes()` returns `.default`, so the credential carries whatever the Azure app
-was consented for. A `read_only` server still holds a write-capable Graph token, and the
-setting is a line in `config.json` rather than anything Microsoft checks. Documented
-honestly in README and SECURITY.md as of 2026-09-12; this entry is about closing it for
-real.
+`read_only: true` gates this server's write tools. It does not narrow the token: sign-in
+consents the read-write scopes and every refresh asks for `.default`, so the credential
+carries whatever the Azure app was consented for. A `read_only` server still holds a
+write-capable Graph token, and the setting is a line in `config.json` rather than anything
+Microsoft checks. Documented honestly in README and SECURITY.md as of 2026-09-12; this
+entry is about closing it for real.
 
-**Shape:** let the read-only path use a *separately consented* Azure app. Either a second
-`client_id` in config (`read_only_client_id`), or documentation plus a preflight check that
-warns when `read_only: true` is paired with an app holding write consent. The token cache is
-keyed per client id, so the two coexist without interfering.
+**Shipped:** the consent half. `read_only_consent: true` makes `outlook-mcp auth`
+ask a *separately registered* read-only app for the read scopes only, the config refuses
+that key without `read_only: true`, and a sign-in saved for one `client_id` is no longer
+used after the config names another.
+
+**Still open:** a preflight check that warns when `read_only: true` is paired with an app
+holding write consent. Nothing yet tells an operator that the "read-only" app they pointed
+at was granted write access at some earlier sign-in.
 
 **Why it is not just done:** it pushes a second app registration onto the user, and the
 five-minute Azure setup is already the steepest part of onboarding. Most people will skip it
@@ -111,6 +115,7 @@ For the population installing this from the MCP registry, not for Neo. stdio sta
 
 ## Done
 
+- **1.24.0** — A security release, from a review of everything since 1.23.0. No problem in any contributor's change and nothing exploitable in the default setup on macOS or Linux; on Windows, an attachment path from the agent could make the machine sign in to another host (1.20.0–1.23.0), and is now refused before it is resolved. The optional settings were weaker than documented. `read_only_consent` makes a second, read-only app registration usable again, which #101's always-read-write first consent had closed, `outlook-mcp auth` warns a read-only config before it asks for write access, and a saved sign-in is refused after `client_id` changes. Calendar invitations, rewording an event with attendees and RSVP messages need `mail_send` under `allow_categories`. The draft tools only touch drafts. A delta cursor only works with its own tool's endpoint. The Graph client authenticates requests to Graph only, the server starts at WARNING so request URLs stay out of stderr, and refusals name a setting without telling the agent to change it. `uv.lock` moves to pyjwt 2.15.1 and urllib3 2.8.0. No tool-count change. #107, #108.
 - **1.23.0** — A data-safety fix, found by measuring rather than assuming: changing a recurring series' start, end, range or pattern makes Graph silently restore every occurrence someone had edited or deleted, and `outlook_update_event` let it happen. It now reads the series' changed occurrences first and refuses, naming them, with the patch pinned by `If-Match` so an edit made in the meantime turns into a `412` instead of being lost (#83, @neilbrencode). The rest of the release: events anchored in a real time zone, so recurring series survive daylight saving (#76), and re-anchorable on update with the weekday following the local date (#83); To Do sub-steps, detail reads and attachments (+8 tools, #67, @Nyaecho); `showAs` on events (#73); secondary calendars and a real `type` in event listings (#62, #84); contacts round-tripping addresses, categories and notes (#63); a guard that each `$select` covers what its formatter reads, added after `classification` came back empty outside the inbox listing (#65). Breaking: the in-process multi-account tools are removed in favour of one server per account via `OUTLOOK_MCP_CONFIG_DIR` (#79), so 70 → 68 tools. Shipped knowing `is_online` now behaves differently by personal account (honoured on two contributors' mailboxes, still ignored on the maintainer's as of 2026-09-30), while the docs say it never works (#70, next).
 - **1.22.1** — Hotfix, cut from the 1.22.0 tag on `release/1.22.x` so the work merged to `main` since then didn't ship without its live tier. One change: `microsoft-kiota-*` capped below 1.13. kiota 1.13 (2026-09-18) moved per-request options to `request.extensions`; `msgraph-core` 1.5.1 still reads the old attribute, so its `/users/me-token-to-replace` → `/me` rewrite stopped firing and every `/me` call on a fresh install failed (#80) — while the lock file kept CI and every developer install on kiota 1.12.3, green. The second time an unbounded dependency broke every fresh install under a green suite (the first was `mcp`, 2026-07). `tests/test_me_rewrite_reaches_the_wire.py` asserts on the URL the real middleware pipeline sends, against whatever versions the environment resolved. Lift the cap once a `msgraph-core` release carries msgraph-sdk-python-core#1129. No tool-count change.
 - **1.22.0** — Runs on hosts with no IANA time zone database (Windows, Alpine/distroless): every calendar tool had failed there, and silently, because `ZoneInfoNotFoundError` was an unexpected exception whose text the SDK withholds. `tzdata` is now a dependency, and an unresolvable zone says which of the two fixes applies (#53, #54 — reported and fixed by @neilbrencode). The calendar window no longer opens an hour early during a DST fall-back (aware-datetime arithmetic resets PEP 495's `fold`). `read_only` documented as what it is: a tool gate, not a token scope. No tool-count change.

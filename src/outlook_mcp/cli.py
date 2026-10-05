@@ -63,10 +63,21 @@ def cmd_auth() -> None:
         sys.exit(1)
 
     auth = AuthManager(config)
-    # Always the read-write set, whatever read_only says: that flag gates the
-    # tools, not the token, and a read-only first consent could never be
-    # widened once the config flips.
-    print("Authenticating with the read-write scopes...")
+    # The read-write set whatever read_only says: that flag gates the tools,
+    # not the token, and a consent narrowed by it could never be widened once
+    # the config flips. Only the explicit read_only_consent key asks for less.
+    mode = "read-only" if config.read_only_consent else "read-write"
+    print(f"Authenticating with the {mode} scopes...")
+    if config.read_only and not config.read_only_consent:
+        # The one setup this can bite: client_id pointing at a second, read-only
+        # app registration, which 1.23.0 signed in with `.default` and so never
+        # asked for write access. Said before the browser opens, because
+        # accepting that consent screen is not undone by changing the config.
+        print(
+            "Note: read_only is set, but this sign-in asks for write access too. "
+            "If client_id is a read-only app registration, stop here (Ctrl-C), set "
+            "read_only_consent: true, and run `outlook-mcp auth` again."
+        )
     print()
 
     try:
@@ -111,7 +122,15 @@ def cmd_status() -> None:
     print(f"Mode:      {'read-only' if config.read_only else 'read-write'}")
     print()
 
-    if auth.try_cached_token():
+    try:
+        authenticated = auth.try_cached_token()
+    except OutlookMCPError as exc:
+        # A refusal rather than a stale token (the plaintext-cache one is
+        # re-raised): it carries its own remedy, which a traceback would bury.
+        print("Status: not authenticated")
+        print(str(exc))
+        return
+    if authenticated:
         print("Status: authenticated (cached token valid)")
     else:
         print("Status: not authenticated")

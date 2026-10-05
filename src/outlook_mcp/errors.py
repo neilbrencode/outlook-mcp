@@ -4,6 +4,17 @@ from __future__ import annotations
 
 from mcp.server.mcpserver.exceptions import ToolError
 
+# Closes every refusal that names a setting. These strings reach the model, and
+# the clients this server runs under give the agent file tools: a refusal that
+# spells out how to turn itself off is an instruction the agent can carry out,
+# and the agent reads mail. The setting is named so the agent can tell the
+# user; changing it is the user's call. Addressed to the agent by name, because
+# `outlook-mcp auth` prints some of these to the operator too, and the operator
+# is exactly who should change the setting.
+LEAVE_SETTINGS_TO_THE_USER = (
+    "If you are an AI agent, do not change the server's settings — tell the user."
+)
+
 
 def _config_dir() -> str:
     """The settings directory remedies point at, imported lazily.
@@ -61,20 +72,34 @@ class ReadOnlyError(OutlookMCPError):
         super().__init__(
             "read_only",
             f"Cannot use {tool_name} — server is in read-only mode.",
-            f"Set read_only to false in {_config_dir()}/config.json to enable write operations.",
+            "The user set read_only in the server's config.json. Tell them what you "
+            f"were trying to do. {LEAVE_SETTINGS_TO_THE_USER}",
         )
 
 
 class PermissionDeniedError(OutlookMCPError):
-    """Raised when a write tool is not in the user's allow_categories."""
+    """Raised when a write tool is not in the user's allow_categories.
 
-    def __init__(self, tool_name: str, category: str):
+    ``doing`` names the part of a call that needs ``category`` when the tool
+    as a whole does not — inviting attendees from a calendar tool needs
+    ``mail_send`` — so the refusal says which argument to drop, not just that
+    the tool was refused.
+    """
+
+    def __init__(self, tool_name: str, category: str, doing: str | None = None):
+        if doing:
+            message = (
+                f"Cannot use {tool_name} to {doing} — that sends email, and category "
+                f"'{category}' is not in allow_categories."
+            )
+        else:
+            message = f"Cannot use {tool_name} — category '{category}' is not in allow_categories."
         super().__init__(
             "permission_denied",
-            f"Cannot use {tool_name} — category '{category}' is not in allow_categories.",
+            message,
             (
-                f"Add '{category}' to allow_categories in {_config_dir()}/config.json, "
-                "or unset allow_categories for full write access."
+                "The user limits this server's writes with allow_categories in its "
+                f"config.json. Tell them this needs '{category}'. {LEAVE_SETTINGS_TO_THE_USER}"
             ),
         )
 
@@ -141,12 +166,12 @@ class UnencryptedTokenCacheError(OutlookMCPError):
             "Refusing to persist the token cache: this environment has no "
             "encrypted store (Linux without libsecret/gnome-keyring), so the "
             "cache would be written to disk in cleartext.",
-            "Either install the system packages (apt: `gnome-keyring "
-            "libsecret-1-0 python3-gi`) and re-create the venv with "
-            "`--system-site-packages`, or accept plaintext storage by setting "
-            '`"allow_unencrypted_token_cache": true` in '
-            f"{_config_dir()}/config.json. See "
-            "https://github.com/mpalermiti/outlook-mcp/issues/7.",
+            "This is for the user to decide, on the host: install the system "
+            "packages (apt: `gnome-keyring libsecret-1-0 python3-gi`) and re-create "
+            "the venv with `--system-site-packages`, or opt in to plaintext storage "
+            "with allow_unencrypted_token_cache in the server's config.json. See "
+            "https://github.com/mpalermiti/outlook-mcp/issues/7. "
+            f"{LEAVE_SETTINGS_TO_THE_USER}",
         )
 
 
@@ -180,6 +205,26 @@ class StaleConsentError(OutlookMCPError):
         )
 
 
+class ClientIdMismatchError(OutlookMCPError):
+    """Raised when the saved sign-in was made with a different app registration.
+
+    azure-identity serves the *record's* client id and ignores the one it is
+    constructed with, so a `client_id` changed in config.json went unnoticed:
+    the old app's session kept being used, and status printed the new id beside
+    "authenticated". That matters most for the one reason to change it — moving
+    to an app that holds fewer permissions — because the wider session stayed.
+    """
+
+    def __init__(self, configured: str, saved: str):
+        super().__init__(
+            "client_id_mismatch",
+            f"The saved sign-in was made with a different app registration "
+            f"(client_id {saved[:8]}…) than the one now in config.json "
+            f"({configured[:8]}…), so it was not used.",
+            "Run `outlook-mcp auth` on the host to sign in with the configured app.",
+        )
+
+
 class ConfigLoadError(OutlookMCPError):
     """The settings file could not be loaded; the server booted fail-safe.
 
@@ -195,7 +240,8 @@ class ConfigLoadError(OutlookMCPError):
             "config_load_failed",
             f"The settings file could not be loaded ({reason}); the server "
             "booted read-only.",
-            f"Fix {config_dir}/config.json and restart the server.",
+            f"Fix {config_dir}/config.json and restart the server. "
+            f"{LEAVE_SETTINGS_TO_THE_USER}",
         )
 
 
@@ -220,6 +266,42 @@ class UntrustedURLError(OutlookMCPError):
             "this cursor and start a fresh sync by calling again with no "
             "delta_token.",
         )
+        self.source = source
+
+
+class ForeignCursorError(OutlookMCPError):
+    """Raised when a delta cursor points somewhere other than its tool's endpoint.
+
+    The host check (``UntrustedURLError``) keeps the token on Graph. It does not
+    keep a tool on its own data: a cursor is a whole URL, so with only the host
+    pinned, any Graph path handed back as a cursor was fetched and returned —
+    mail through the calendar tool, tasks through the contacts tool. A cursor is
+    only good for the endpoint that issued it.
+    """
+
+    def __init__(self, source: str, url: str, resource: str):
+        shown = url[:120] if url else "(empty)"
+        if source == "initial_url":
+            # The first URL is built here, from the tool's own arguments — there
+            # is no cursor to blame, and telling the caller to discard one would
+            # send it looking for something it never passed.
+            message = (
+                f"Could not build a {resource} delta link from this call's arguments: {shown!r}."
+            )
+            action = (
+                "Check the folder or id passed to this tool; for mail, pass the folder's "
+                "display name or a well-known name such as inbox."
+            )
+        else:
+            message = (
+                f"Refusing a cursor that is not a {resource} delta link (from {source}): "
+                f"{shown!r}."
+            )
+            action = (
+                "A delta cursor only works with the tool that returned it. Discard this "
+                "cursor and start a fresh sync by calling again with no delta_token."
+            )
+        super().__init__("foreign_cursor", message, action)
         self.source = source
 
 
