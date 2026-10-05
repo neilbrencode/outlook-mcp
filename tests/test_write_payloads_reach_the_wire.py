@@ -120,8 +120,7 @@ def assert_on_wire(model, *needles: str, allow_null: bool = False) -> None:
 
     missing = [n for n in needles if n not in body]
     assert not missing, (
-        f"Argument value(s) never reached the serialized payload: {missing}\n"
-        f"Wire JSON was:\n{body}"
+        f"Argument value(s) never reached the serialized payload: {missing}\nWire JSON was:\n{body}"
     )
 
     pairs = _walk_keys(body)
@@ -303,6 +302,7 @@ class TestCalendarWrite:
             '"timeZone": "America/New_York"',
             '"dateTime": "2026-10-22T09:00:00"',
         )
+
     async def test_update_event_show_as_alone_patches_nothing_else(self):
         """The shape a partial patch has to have: one field in, one field out.
 
@@ -431,9 +431,7 @@ class TestCalendarWrite:
             client, event_id="AAMkAG123=", remove_recurrence=True, config=_CFG
         )
 
-        assert_on_wire(
-            builder.patch.call_args[0][0], '"recurrence": null', allow_null=True
-        )
+        assert_on_wire(builder.patch.call_args[0][0], '"recurrence": null', allow_null=True)
 
 
 # ── mail ──────────────────────────────────────────────────────────────
@@ -664,6 +662,15 @@ class TestContacts:
 # ── to do ─────────────────────────────────────────────────────────────
 
 
+def _todo_task_request(client):
+    """The mocked request builder for one task: what `tasks.by_todo_task_id(...)` returns.
+
+    Named once because the chain is wider than a line and has no call to break
+    at: ruff format joins it back onto one line, which E501 then rejects.
+    """
+    return client.me.todo.lists.by_todo_task_list_id.return_value.tasks.by_todo_task_id.return_value
+
+
 class TestTodo:
     async def test_create_task_every_argument_reaches_the_wire(self):
         from tests.test_todo import _build_mock_client
@@ -711,9 +718,7 @@ class TestTodo:
             config=_CFG,
         )
 
-        patch = (
-            client.me.todo.lists.by_todo_task_list_id.return_value.tasks.by_todo_task_id.return_value.patch
-        )
+        patch = _todo_task_request(client).patch
         assert_on_wire(
             patch.call_args.args[0],
             "SENTINEL-TITLE-d31",
@@ -734,9 +739,7 @@ class TestTodo:
             config=_CFG,
         )
 
-        post = (
-            client.me.todo.lists.by_todo_task_list_id.return_value.tasks.by_todo_task_id.return_value.checklist_items.post
-        )
+        post = _todo_task_request(client).checklist_items.post
         assert_on_wire(post.call_args.args[0], '"displayName": "SENTINEL-STEP-e41"')
 
     async def test_update_checklist_item_partial_patch_sends_only_what_was_asked(self):
@@ -755,9 +758,7 @@ class TestTodo:
             config=_CFG,
         )
 
-        item = (
-            client.me.todo.lists.by_todo_task_list_id.return_value.tasks.by_todo_task_id.return_value.checklist_items.by_checklist_item_id.return_value
-        )
+        item = _todo_task_request(client).checklist_items.by_checklist_item_id.return_value
         payload = item.patch.call_args.args[0]
         assert_on_wire(payload, '"displayName": "SENTINEL-RENAME-e42"')
 
@@ -781,9 +782,7 @@ class TestTodo:
             config=_CFG,
         )
 
-        item = (
-            client.me.todo.lists.by_todo_task_list_id.return_value.tasks.by_todo_task_id.return_value.checklist_items.by_checklist_item_id.return_value
-        )
+        item = _todo_task_request(client).checklist_items.by_checklist_item_id.return_value
         payload = item.patch.call_args.args[0]
         assert_on_wire(payload, '"isChecked": true')
 
@@ -808,9 +807,7 @@ class TestTodo:
             config=_cfg(tmp_path),
         )
 
-        post = (
-            client.me.todo.lists.by_todo_task_list_id.return_value.tasks.by_todo_task_id.return_value.attachments.post
-        )
+        post = _todo_task_request(client).attachments.post
         assert_on_wire(
             post.call_args.args[0],
             '"@odata.type": "#microsoft.graph.taskFileAttachment"',
